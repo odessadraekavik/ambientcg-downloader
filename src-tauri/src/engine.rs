@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 // ---------- paths & persistence ----------
 
@@ -140,7 +141,7 @@ pub fn http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent("AmbientCG-Downloader/0.1 (personal library sync)")
         .connect_timeout(Duration::from_secs(20))
-        .read_timeout(Duration::from_secs(60))
+        .read_timeout(Duration::from_secs(30))
         .build()?)
 }
 
@@ -160,7 +161,7 @@ async fn fetch_to(
         let mut got = 0u64;
         let res: Result<()> = async {
             let resp = client.get(url).send().await?.error_for_status()?;
-            let mut file = tokio::fs::File::create(dest).await?;
+            let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(dest).await?);
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 if cancel.load(Relaxed) {
@@ -271,6 +272,7 @@ pub async fn download_all(
     stats: Arc<Stats>,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
+    let n = concurrency.clamp(1, 8);
     let tmp_dir = root.join(".tmp");
     let _ = fs::remove_dir_all(&tmp_dir);
     fs::create_dir_all(&tmp_dir)?;
@@ -280,78 +282,117 @@ pub async fn download_all(
 
     let manifest = Arc::new(Mutex::new(load_manifest(&root)));
     let since_save = Arc::new(AtomicU64::new(0));
+    // Separate limits: network slots are freed as soon as the zip is on disk,
+    // so slow extraction (antivirus!) never starves the downloads.
+    let dl_sem = Arc::new(Semaphore::new(n));
+    let ex_sem = Arc::new(Semaphore::new(n));
+    let mut set = tokio::task::JoinSet::new();
 
-    futures::stream::iter(items)
-        .for_each_concurrent(concurrency.clamp(1, 8), |item| {
-            let (root, tmp_dir, client) = (root.clone(), tmp_dir.clone(), client.clone());
-            let (stats, cancel) = (stats.clone(), cancel.clone());
-            let (manifest, since_save) = (manifest.clone(), since_save.clone());
-            async move {
-                if cancel.load(Relaxed) {
-                    return;
-                }
-                stats.active.lock().unwrap().insert(item.file.clone(), (item.asset_id.clone(), 0, item.size));
-                let result = process(&client, &root, &tmp_dir, &item, &stats, &cancel).await;
-                stats.active.lock().unwrap().remove(&item.file);
-                match result {
-                    Ok(()) => {
-                        stats.files_done.fetch_add(1, Relaxed);
-                        stats.completed.lock().unwrap().push(Completed {
-                            id: item.asset_id.clone(),
+    for item in items {
+        if cancel.load(Relaxed) {
+            break;
+        }
+        let Ok(permit) = dl_sem.clone().acquire_owned().await else { break };
+        if cancel.load(Relaxed) {
+            break;
+        }
+        let (root, tmp_dir, client, ex_sem) = (root.clone(), tmp_dir.clone(), client.clone(), ex_sem.clone());
+        let (stats, cancel) = (stats.clone(), cancel.clone());
+        let (manifest, since_save) = (manifest.clone(), since_save.clone());
+        // Every item is its own task, so downloads really run in parallel on the runtime's threads.
+        set.spawn(async move {
+            stats
+                .active
+                .lock()
+                .unwrap()
+                .insert(item.file.clone(), (item.asset_id.clone(), 0, item.size));
+            let result = run_item(&client, &root, &tmp_dir, &item, &stats, &cancel, permit, &ex_sem).await;
+            stats.active.lock().unwrap().remove(&item.file);
+            match result {
+                Ok(()) => {
+                    stats.files_done.fetch_add(1, Relaxed);
+                    stats.completed.lock().unwrap().push(Completed {
+                        id: item.asset_id.clone(),
+                        attr: item.attr.clone(),
+                        rel: item.rel_dir.clone(),
+                    });
+                    let mut m = manifest.lock().unwrap();
+                    m.done.insert(
+                        item.file.clone(),
+                        Done {
+                            asset: item.asset_id.clone(),
                             attr: item.attr.clone(),
-                            rel: item.rel_dir.clone(),
-                        });
-                        let mut m = manifest.lock().unwrap();
-                        m.done.insert(
-                            item.file.clone(),
-                            Done {
-                                asset: item.asset_id.clone(),
-                                attr: item.attr.clone(),
-                                dir: item.rel_dir.clone(),
-                                size: item.size,
-                            },
-                        );
-                        if since_save.fetch_add(1, Relaxed) % 10 == 9 {
-                            let _ = save_manifest(&root, &m);
-                        }
+                            dir: item.rel_dir.clone(),
+                            size: item.size,
+                        },
+                    );
+                    if since_save.fetch_add(1, Relaxed) % 10 == 9 {
+                        let _ = save_manifest(&root, &m);
                     }
-                    Err(e) => {
-                        if !cancel.load(Relaxed) {
-                            stats.failed.fetch_add(1, Relaxed);
-                            *stats.last_error.lock().unwrap() = format!("{}: {e:#}", item.file);
-                        }
+                }
+                Err(e) => {
+                    if !cancel.load(Relaxed) {
+                        stats.failed.fetch_add(1, Relaxed);
+                        let msg = format!("{}: {e:#}", item.file);
+                        log_error(&root, &msg);
+                        *stats.last_error.lock().unwrap() = msg;
                     }
                 }
             }
-        })
-        .await;
+        });
+        while set.try_join_next().is_some() {}
+    }
+    while set.join_next().await.is_some() {}
 
     save_manifest(&root, &manifest.lock().unwrap())?;
     let _ = fs::remove_dir_all(&tmp_dir);
     Ok(())
 }
 
-async fn process(
+fn log_error(root: &Path, msg: &str) {
+    use std::io::Write;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(root.join(".errors.log")) {
+        let _ = writeln!(f, "[{secs}] {msg}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_item(
     client: &reqwest::Client,
     root: &Path,
     tmp_dir: &Path,
     item: &Item,
     stats: &Stats,
     cancel: &AtomicBool,
+    dl_permit: OwnedSemaphorePermit,
+    ex_sem: &Arc<Semaphore>,
 ) -> Result<()> {
     let part = tmp_dir.join(format!("{}.part", item.file));
     fetch_to(client, &item.url, &part, Some(stats), &item.file, cancel).await?;
+
+    // Hand the network slot to the next download; wait for an extraction slot first
+    // so finished zips can't pile up on disk faster than they are unpacked.
+    let _ex = ex_sem.clone().acquire_owned().await?;
+    drop(dl_permit);
+    if cancel.load(Relaxed) {
+        let _ = fs::remove_file(&part);
+        bail!("cancelled");
+    }
+
     let dest = root.join(&item.rel_dir);
     let is_zip = item.file.to_ascii_lowercase().ends_with(".zip");
-    let part2 = part.clone();
     let file = item.file.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         if is_zip {
-            extract_zip(&part2, &dest).with_context(|| format!("extracting {file}"))?;
-            fs::remove_file(&part2)?;
+            extract_zip(&part, &dest).with_context(|| format!("extracting {file}"))?;
+            fs::remove_file(&part)?;
         } else {
             fs::create_dir_all(&dest)?;
-            fs::rename(&part2, dest.join(&file))?;
+            fs::rename(&part, dest.join(&file))?;
         }
         Ok(())
     })

@@ -283,6 +283,11 @@ fn exe_dir() -> Option<String> {
 }
 
 #[tauri::command]
+fn log_frontend(message: String) {
+    log::line(&format!("UI error: {message}"));
+}
+
+#[tauri::command]
 fn open_log() -> Result<(), String> {
     let p = log::path().ok_or("No log yet")?;
     let mut cmd = std::process::Command::new("explorer");
@@ -329,6 +334,7 @@ pub fn run() {
             let dir = app.path().app_config_dir()?;
             fs::create_dir_all(&dir)?;
             log::init(&dir);
+            log::set_handle(app.handle().clone());
             log::line(&format!("app started, v{}", env!("CARGO_PKG_VERSION")));
             let settings_file = dir.join("settings.json");
             let settings: Settings = fs::read(&settings_file)
@@ -355,9 +361,15 @@ pub fn run() {
             cancel_sync,
             exe_dir,
             open_log,
+            log_frontend,
             open_library,
             open_folder
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running the app");
+        .build(tauri::generate_context!())
+        .expect("error while building the app")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                log::clean_exit();
+            }
+        });
 }

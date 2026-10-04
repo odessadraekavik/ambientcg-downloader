@@ -28,3 +28,6 @@ lto = true
 codegen-units = 1
 opt-level = "s"
 strip = true
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }

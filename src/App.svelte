@@ -12,6 +12,7 @@
   let progress = $state(null);
   let busy = $state(false);
   let cancelling = $state(false);
+  let crash = $state(null);
   let plan = $state(null);
   let showSettings = $state(false);
   let selected = $state(null);
@@ -95,6 +96,16 @@
 
   onMount(() => {
     let unlisten;
+    let unlistenCrash;
+    const show = (text) => {
+      crash = text;
+      invoke('log_frontend', { message: text.slice(0, 1500) }).catch(() => {});
+    };
+    const onError = (ev) => show(`${ev.message ?? 'Error'}\n${ev.error?.stack ?? ''}`);
+    const onRejection = (ev) => show(`Unhandled promise rejection: ${ev.reason?.stack ?? ev.reason}`);
+    window.addEventListener('error', onError);
+    window.addEventListener('unhandledrejection', onRejection);
+    listen('crash', (e) => (crash = e.payload)).then((u) => (unlistenCrash = u));
     (async () => {
       settings = await invoke('get_settings');
       await loadLibrary();
@@ -118,7 +129,13 @@
       if (ev.key === 'Escape') { if (selected) selected = null; else if (query) query = ''; }
     };
     window.addEventListener('keydown', key);
-    return () => { unlisten?.(); window.removeEventListener('keydown', key); };
+    return () => {
+      unlisten?.();
+      unlistenCrash?.();
+      window.removeEventListener('keydown', key);
+      window.removeEventListener('error', onError);
+      window.removeEventListener('unhandledrejection', onRejection);
+    };
   });
 
   const kinds = $derived.by(() => {
@@ -288,6 +305,20 @@
     </div>
   {/if}
 
+  {#if crash}
+    <div class="scrim crashscrim" role="presentation"></div>
+    <div class="modal crash" role="alertdialog" aria-labelledby="crash-title">
+      <h2 id="crash-title">Something went wrong</h2>
+      <p class="hint">The details below were also saved to the log file. Please include them if you report this.</p>
+      <pre>{crash}</pre>
+      <div class="actions">
+        <button class="ghost" onclick={() => { navigator.clipboard?.writeText(crash); say('Copied'); }}>Copy details</button>
+        <button class="ghost" onclick={() => invoke('open_log').catch((e) => say(String(e)))}>Show log file</button>
+        <button class="primary" onclick={() => (crash = null)}>Dismiss</button>
+      </div>
+    </div>
+  {/if}
+
   {#if selected}
     <div class="scrim" onclick={() => (selected = null)} role="presentation"></div>
     <div class="modal detail">
@@ -395,5 +426,9 @@
   .folders { margin-top: 0; }
   .tag { background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; font-size: 12px; color: var(--muted); }
   .tag:hover { color: var(--text); border-color: var(--accent); }
+  .crashscrim { z-index: 60; }
+  .crash { z-index: 61; width: min(720px, 94vw); border-color: var(--bad); }
+  .crash h2 { color: var(--bad); }
+  .crash pre { user-select: text; max-height: 300px; overflow: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font: 12px/1.45 Consolas, monospace; white-space: pre-wrap; word-break: break-word; margin: 12px 0 0; }
   .x { position: absolute; top: 10px; right: 10px; }
 </style>

@@ -8,11 +8,15 @@
 ![Svelte](https://img.shields.io/badge/Svelte-5-FF3E00?logo=svelte&logoColor=white)
 ![Rust](https://img.shields.io/badge/Rust-backend-DEA584?logo=rust&logoColor=white)
 ![Platform](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/license-GPLv3-blue)
 
 </div>
 
 > **Unofficial.** This project is not affiliated with or endorsed by ambientCG. All assets are published by ambientCG under [CC0](https://creativecommons.org/publicdomain/zero/1.0/). If you use their library, please consider [supporting them](https://ambientcg.com/).
+
+<p align="center">
+  <img src="media/library.png" alt="Library grid with live per-thumbnail download progress" width="820">
+</p>
 
 ---
 
@@ -47,6 +51,10 @@
 ```
 
 File names inside each asset are kept exactly as ambientCG ships them, because the bundled `.usdc` / `.mtlx` files reference them.
+
+<p align="center">
+  <img src="media/settings.png" alt="Settings drawer: library folder, resolutions, formats, asset types" width="620">
+</p>
 
 ## 🚀 Getting started
 
@@ -85,4 +93,4 @@ Be kind to ambientCG's servers: the app identifies itself with its own user-agen
 
 ## 📄 License
 
-[MIT](LICENSE) for this app's code. The downloaded assets are © ambientCG, released under CC0.
+[GPL-3.0-or-later](LICENSE) for this app's code. The downloaded assets are © ambientCG, released under CC0.

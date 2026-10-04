@@ -2,6 +2,7 @@
 name = "ambientcg-downloader"
 version = "0.1.0"
 description = "Download and organise the entire AmbientCG library"
+license = "GPL-3.0-or-later"
 edition = "2021"
 
 [lib]

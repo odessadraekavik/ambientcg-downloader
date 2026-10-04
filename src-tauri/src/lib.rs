@@ -1,5 +1,6 @@
 mod catalogue;
 mod engine;
+mod log;
 mod model;
 
 use model::*;
@@ -167,9 +168,18 @@ async fn prepare_sync(app: AppHandle, state: State<'_, AppState>) -> Result<Plan
     let s = state.settings.lock().unwrap().clone();
     let root = state.root()?;
     let cancel = state.begin()?;
-    let res = prepare(app, state.client.clone(), s, root, cancel).await;
+    log::line("sync: preparing (catalogue + thumbnails)");
+    // Run in its own task so a panic is reported instead of leaving the UI waiting forever.
+    let res = match tauri::async_runtime::spawn(prepare(app, state.client.clone(), s, root, cancel)).await {
+        Ok(r) => r,
+        Err(e) => Err(format!("internal error: {e} (see app.log)")),
+    };
     state.end();
+    if let Err(e) = &res {
+        log::line(&format!("sync: prepare ended: {e}"));
+    }
     let items = res?;
+    log::line(&format!("sync: plan ready, {} files", items.len()));
     let summary = engine::summarize(&items);
     *state.pending.lock().unwrap() = items;
     Ok(summary)
@@ -209,8 +219,20 @@ fn start_download(app: AppHandle, state: State<AppState>) -> Result<(), String> 
             })
         };
 
-        let result =
-            engine::download_all(client, root, items, s.concurrency, stats.clone(), cancel.clone()).await;
+        log::line(&format!("download: starting {} files", items.len()));
+        let job = tauri::async_runtime::spawn(engine::download_all(
+            client,
+            root,
+            items,
+            s.concurrency,
+            stats.clone(),
+            cancel.clone(),
+        ));
+        let result = match job.await {
+            Ok(r) => r,
+            Err(e) => Err(anyhow::anyhow!("internal error: {e} (see app.log)")),
+        };
+        log::line(&format!("download: ended ({} done, {} failed)", stats.files_done.load(Relaxed), stats.failed.load(Relaxed)));
         finished.store(true, Relaxed);
         let _ = ticker.await;
 
@@ -261,6 +283,20 @@ fn exe_dir() -> Option<String> {
 }
 
 #[tauri::command]
+fn open_log() -> Result<(), String> {
+    let p = log::path().ok_or("No log yet")?;
+    let mut cmd = std::process::Command::new("explorer");
+    cmd.arg(format!("/select,{}", p.display()));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd.spawn().map_err(e2s)?;
+    Ok(())
+}
+
+#[tauri::command]
 fn open_library(state: State<AppState>) -> Result<(), String> {
     let root = state.root()?;
     fs::create_dir_all(&root).map_err(e2s)?;
@@ -292,6 +328,8 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_config_dir()?;
             fs::create_dir_all(&dir)?;
+            log::init(&dir);
+            log::line(&format!("app started, v{}", env!("CARGO_PKG_VERSION")));
             let settings_file = dir.join("settings.json");
             let settings: Settings = fs::read(&settings_file)
                 .ok()
@@ -316,6 +354,7 @@ pub fn run() {
             start_download,
             cancel_sync,
             exe_dir,
+            open_log,
             open_library,
             open_folder
         ])

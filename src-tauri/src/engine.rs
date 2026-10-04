@@ -401,14 +401,8 @@ pub async fn download_all(
 }
 
 fn log_error(root: &Path, msg: &str) {
-    use std::io::Write;
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(root.join(".errors.log")) {
-        let _ = writeln!(f, "[{secs}] {msg}");
-    }
+    crate::log::append(&root.join(".errors.log"), msg);
+    crate::log::line(&format!("download failed: {msg}"));
 }
 
 #[allow(clippy::too_many_arguments)]

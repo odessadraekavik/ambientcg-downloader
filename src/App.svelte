@@ -267,7 +267,8 @@
 
   {#if showSettings}
     <Settings {settings} {estimate} locked={busy} onchange={saveSettings} onpick={pickFolder}
-      onopen={() => invoke('open_library').catch((e) => say(String(e)))} onclose={() => (showSettings = false)} />
+      onopen={() => invoke('open_library').catch((e) => say(String(e)))}
+      onlog={() => invoke('open_log').catch((e) => say(String(e)))} onclose={() => (showSettings = false)} />
   {/if}
 
   {#if plan}

@@ -1,7 +1,7 @@
 <script>
   import { ALL_FORMATS, ALL_RESOLUTIONS, ALL_TYPES, TYPE_LABELS, fmtBytes } from './format.js';
 
-  let { settings, estimate, locked, onchange, onpick, onopen, onclose } = $props();
+  let { settings, estimate, locked, onchange, onpick, onopen, onlog, onclose } = $props();
 
   function toggle(list, value) {
     const i = list.indexOf(value);
@@ -27,6 +27,9 @@
       <div class="row">
         <button class="btn" onclick={onpick} disabled={locked}>Change…</button>
         <button class="btn ghost" onclick={onopen} disabled={!settings.libraryPath}>Open in Explorer</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn ghost" onclick={onlog}>Show log file</button>
       </div>
       <p class="hint">Files go into an <b>AmbientCG</b> folder inside it, sorted as <code>Type / Resolution / Category / Asset</code>.</p>
     </section>

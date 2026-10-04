@@ -11,6 +11,7 @@
   let estimate = $state(null);
   let progress = $state(null);
   let busy = $state(false);
+  let cancelling = $state(false);
   let plan = $state(null);
   let showSettings = $state(false);
   let selected = $state(null);
@@ -74,8 +75,8 @@
       if (p.files === 0) { busy = false; say('Everything is up to date ✓'); }
       else plan = p;
     } catch (e) {
-      busy = false; progress = null;
-      if (e !== 'cancelled') say(String(e));
+      busy = false; progress = null; cancelling = false;
+      say(e === 'cancelled' ? 'Cancelled' : String(e));
     }
   }
 
@@ -86,7 +87,11 @@
   }
 
   function cancelPlan() { plan = null; busy = false; }
-  const cancel = () => invoke('cancel_sync');
+  async function cancel() {
+    cancelling = true;
+    const running = await invoke('cancel_sync');
+    if (!running) { busy = false; cancelling = false; progress = null; }
+  }
 
   onMount(() => {
     let unlisten;
@@ -96,7 +101,7 @@
       unlisten = await listen('sync-progress', async (e) => {
         const p = e.payload;
         if (['done', 'cancelled', 'error'].includes(p.phase)) {
-          progress = null; busy = false;
+          progress = null; busy = false; cancelling = false;
           say(p.message);
           await loadLibrary();
         } else {
@@ -170,7 +175,7 @@
     </div>
     <button class="icon" onclick={() => (showSettings = true)} aria-label="Settings" title="Settings">⚙</button>
     {#if busy}
-      <button class="primary" onclick={cancel}>Cancel</button>
+      <button class="primary" onclick={cancel} disabled={cancelling}>{cancelling ? 'Cancelling…' : 'Cancel'}</button>
     {:else}
       <button class="primary" onclick={download}>
         Download{#if estimate?.files} · {fmtBytes(estimate.bytes)}{/if}

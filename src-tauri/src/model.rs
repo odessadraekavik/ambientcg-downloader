@@ -58,6 +58,9 @@ pub struct Done {
 pub struct Manifest {
     /// Keyed by file name.
     pub done: HashMap<String, Done>,
+    /// Files that failed in earlier runs (file name -> times failed). Retried last.
+    #[serde(default)]
+    pub failed: HashMap<String, u32>,
 }
 
 #[derive(Clone, Debug)]

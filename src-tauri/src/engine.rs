@@ -73,9 +73,12 @@ pub fn plan(root: &Path, s: &Settings) -> Vec<Item> {
             !(manifest.done.contains_key(&i.file) && root.join(&i.rel_dir).is_dir())
         })
         .collect();
+    // Files that failed before go to the very end (the more failures, the later).
+    let fails = |i: &Item| manifest.failed.get(&i.file).copied().unwrap_or(0);
     items.sort_by(|a, b| {
-        res_rank(&a.attr)
-            .cmp(&res_rank(&b.attr))
+        fails(a)
+            .cmp(&fails(b))
+            .then_with(|| res_rank(&a.attr).cmp(&res_rank(&b.attr)))
             .then_with(|| a.asset_id.cmp(&b.asset_id))
     });
     items
@@ -140,9 +143,16 @@ impl Stats {
 pub fn http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent("AmbientCG-Downloader/0.1 (personal library sync)")
-        .connect_timeout(Duration::from_secs(20))
-        .read_timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(8))
+        .read_timeout(Duration::from_secs(12))
         .build()?)
+}
+
+/// Resolves once the cancel flag is set, so network waits can be interrupted immediately.
+async fn cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn fetch_to(
@@ -151,22 +161,29 @@ async fn fetch_to(
     dest: &Path,
     stats: Option<&Stats>,
     key: &str,
+    attempts: u64,
     cancel: &AtomicBool,
 ) -> Result<()> {
     let mut last: Option<anyhow::Error> = None;
-    for attempt in 0..4u64 {
+    for attempt in 0..attempts {
         if cancel.load(Relaxed) {
             bail!("cancelled");
         }
         let mut got = 0u64;
         let res: Result<()> = async {
-            let resp = client.get(url).send().await?.error_for_status()?;
+            let resp = tokio::select! {
+                _ = cancelled(cancel) => bail!("cancelled"),
+                r = client.get(url).send() => r?,
+            };
+            let resp = resp.error_for_status()?;
             let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(dest).await?);
             let mut stream = resp.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                if cancel.load(Relaxed) {
-                    bail!("cancelled");
-                }
+            loop {
+                let next = tokio::select! {
+                    _ = cancelled(cancel) => bail!("cancelled"),
+                    c = stream.next() => c,
+                };
+                let Some(chunk) = next else { break };
                 let c = chunk?;
                 file.write_all(&c).await?;
                 got += c.len() as u64;
@@ -195,7 +212,12 @@ async fn fetch_to(
                     bail!("cancelled");
                 }
                 last = Some(e);
-                tokio::time::sleep(Duration::from_millis(1500 * (attempt + 1))).await;
+                if attempt + 1 < attempts {
+                    tokio::select! {
+                        _ = cancelled(cancel) => bail!("cancelled"),
+                        _ = tokio::time::sleep(Duration::from_millis(1000 * (attempt + 1))) => {}
+                    }
+                }
             }
         }
     }
@@ -245,7 +267,7 @@ pub async fn fetch_thumbnails(
             let (dir, client, cancel) = (dir.clone(), client.clone(), cancel.clone());
             async move {
                 let part = dir.join(format!("{id}.part"));
-                if fetch_to(&client, &url, &part, None, "", &cancel).await.is_ok() {
+                if fetch_to(&client, &url, &part, None, "", 3, &cancel).await.is_ok() {
                     let _ = fs::rename(&part, dir.join(format!("{id}.webp")));
                 }
             }
@@ -264,6 +286,9 @@ pub async fn fetch_thumbnails(
 }
 
 /// Download, extract and register every item. Resumable: finished items are skipped next time.
+/// How often a file is attempted within one run before it is given up until the next run.
+const RUN_TRIES: u32 = 2;
+
 pub async fn download_all(
     client: reqwest::Client,
     root: PathBuf,
@@ -286,19 +311,30 @@ pub async fn download_all(
     // so slow extraction (antivirus!) never starves the downloads.
     let dl_sem = Arc::new(Semaphore::new(n));
     let ex_sem = Arc::new(Semaphore::new(n));
+    let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(items)));
+    let tries: Arc<Mutex<std::collections::HashMap<String, u32>>> = Default::default();
     let mut set = tokio::task::JoinSet::new();
 
-    for item in items {
+    loop {
         if cancel.load(Relaxed) {
             break;
         }
-        let Ok(permit) = dl_sem.clone().acquire_owned().await else { break };
-        if cancel.load(Relaxed) {
-            break;
-        }
+        let next = queue.lock().unwrap().pop_front();
+        let Some(item) = next else {
+            // Queue is empty: wait for running tasks (a failing one may re-queue itself).
+            if set.join_next().await.is_none() {
+                break;
+            }
+            continue;
+        };
+        let permit = tokio::select! {
+            _ = cancelled(&cancel) => break,
+            p = dl_sem.clone().acquire_owned() => match p { Ok(p) => p, Err(_) => break },
+        };
         let (root, tmp_dir, client, ex_sem) = (root.clone(), tmp_dir.clone(), client.clone(), ex_sem.clone());
         let (stats, cancel) = (stats.clone(), cancel.clone());
         let (manifest, since_save) = (manifest.clone(), since_save.clone());
+        let (queue, tries) = (queue.clone(), tries.clone());
         // Every item is its own task, so downloads really run in parallel on the runtime's threads.
         set.spawn(async move {
             stats
@@ -317,6 +353,7 @@ pub async fn download_all(
                         rel: item.rel_dir.clone(),
                     });
                     let mut m = manifest.lock().unwrap();
+                    m.failed.remove(&item.file);
                     m.done.insert(
                         item.file.clone(),
                         Done {
@@ -330,12 +367,26 @@ pub async fn download_all(
                         let _ = save_manifest(&root, &m);
                     }
                 }
+                Err(_) if cancel.load(Relaxed) => {}
                 Err(e) => {
-                    if !cancel.load(Relaxed) {
+                    let msg = format!("{}: {e:#}", item.file);
+                    log_error(&root, &msg);
+                    let attempt = {
+                        let mut t = tries.lock().unwrap();
+                        let c = t.entry(item.file.clone()).or_default();
+                        *c += 1;
+                        *c
+                    };
+                    if attempt < RUN_TRIES {
+                        // Do not hammer a failing file: try it again after everything else.
+                        queue.lock().unwrap().push_back(item);
+                    } else {
                         stats.failed.fetch_add(1, Relaxed);
-                        let msg = format!("{}: {e:#}", item.file);
-                        log_error(&root, &msg);
                         *stats.last_error.lock().unwrap() = msg;
+                        // Remember it, so it is also queued last after a restart.
+                        let mut m = manifest.lock().unwrap();
+                        *m.failed.entry(item.file.clone()).or_default() += 1;
+                        let _ = save_manifest(&root, &m);
                     }
                 }
             }
@@ -372,7 +423,7 @@ async fn run_item(
     ex_sem: &Arc<Semaphore>,
 ) -> Result<()> {
     let part = tmp_dir.join(format!("{}.part", item.file));
-    fetch_to(client, &item.url, &part, Some(stats), &item.file, cancel).await?;
+    fetch_to(client, &item.url, &part, Some(stats), &item.file, 1, cancel).await?;
 
     // Hand the network slot to the next download; wait for an extraction slot first
     // so finished zips can't pile up on disk faster than they are unpacked.

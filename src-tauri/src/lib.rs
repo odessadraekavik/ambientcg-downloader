@@ -234,9 +234,13 @@ fn start_download(app: AppHandle, state: State<AppState>) -> Result<(), String> 
 }
 
 #[tauri::command]
-fn cancel_sync(state: State<AppState>) {
-    if let Some(flag) = state.cancel.lock().unwrap().as_ref() {
-        flag.store(true, Relaxed);
+fn cancel_sync(state: State<AppState>) -> bool {
+    match state.cancel.lock().unwrap().as_ref() {
+        Some(flag) => {
+            flag.store(true, Relaxed);
+            true
+        }
+        None => false,
     }
 }
 
